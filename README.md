@@ -1,186 +1,490 @@
 # Property Listing Sync Service
 
-A backend service that aggregates property listings from multiple UAE real estate platforms (Bayut, Property Finder, Dubizzle), normalizes them into a unified schema, detects cross-platform duplicates, and exposes a clean paginated REST API.
+Aggregates listings from multiple UAE real estate platforms (Bayut, Property Finder, Dubizzle), normalizes data, detects duplicates with fuzzy matching, and exposes a production REST API.
+
+**The problem:** Real estate agencies manually copy-paste listings across platforms and struggle to keep prices/data in sync. This service detects cross-platform duplicates automatically and maintains a single source of truth.
 
 ---
 
-## The Problem
+## Quick Start
 
-Real estate agencies in UAE list the same property on multiple platforms — Bayut, Property Finder, Dubizzle — each with different data formats, field names, and slight price variations. This creates:
+```bash
+# Clone and install
+git clone https://github.com/palwashasheikh/property-sync-service
+cd property-sync-service
+npm install
 
-- **Data inconsistency** — same property with conflicting prices across platforms
-- **Manual overhead** — agents copy-paste listings and keep them in sync manually
-- **No single source of truth** — analytics and reporting are unreliable
+# Setup database
+createdb property_sync
+cp .env.example .env
+# Edit .env with your DB credentials
 
-This service solves that by ingesting all sources, normalizing to one schema, and flagging duplicates automatically.
+# Run migrations and start
+npm run migrate
+npm run dev
+```
+
+Backend runs on `http://localhost:3000`.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   SCHEDULER (cron)                  │
-│              Runs every 30 minutes                  │
-└────────────────────┬────────────────────────────────┘
-                     │
-         ┌───────────▼───────────┐
-         │   INGESTION PIPELINE  │
-         │  (per source)         │
-         └───────────┬───────────┘
-                     │
-         ┌───────────▼───────────┐
-         │      NORMALIZER       │  ← Maps source-specific fields
-         │  Bayut / PF / Dubizzle│    to standard schema
-         └───────────┬───────────┘
-                     │
-         ┌───────────▼───────────┐
-         │  DEDUPLICATION ENGINE │  ← Weighted scoring across
-         │  (fuzzy match)        │    price, area, location, beds
-         └───────────┬───────────┘
-                     │
-         ┌───────────▼───────────┐
-         │     PostgreSQL DB     │
-         │  listings             │
-         │  duplicate_pairs      │
-         │  sync_logs            │
-         └───────────┬───────────┘
-                     │
-         ┌───────────▼───────────┐
-         │      REST API         │
-         │  /api/listings        │
-         │  /api/sync/stats      │
-         │  /api/sync/duplicates │
-         └───────────────────────┘
+┌──────────────────────────────────────┐
+│   INGESTION (every 30 minutes)      │
+│  - Fetch from 3 sources             │
+│  - Normalize to standard schema     │
+│  - Detect duplicates (scoring)      │
+│  - Upsert to PostgreSQL             │
+└──────────────────────────────────────┘
+           │
+        ┌──▼──┐
+        │     │
+   ┌────▼─┐  ┌─▼────┐
+   │Bayut │  │ Property
+   │JSON  │  │ Finder
+   └──────┘  │ XML
+             └───────┘
+   
+   ┌─────────────────────┐
+   │   NORMALIZER        │
+   │  Maps all schemas   │
+   │  to standard fields │
+   └─────────────────────┘
+           │
+   ┌─────────────────────┐
+   │  DEDUPLICATOR       │
+   │  Weighted scoring:  │
+   │  - Location (30pts) │
+   │  - Price (25pts)    │
+   │  - Area (20pts)     │
+   │  - Beds (15pts)     │
+   │  - Type (10pts)     │
+   │  Threshold: 70+     │
+   └─────────────────────┘
+           │
+   ┌─────────────────────┐
+   │   PostgreSQL        │
+   │  - listings         │
+   │  - sync_logs        │
+   │  - duplicate_pairs  │
+   └─────────────────────┘
+           │
+   ┌─────────────────────┐
+   │    REST API         │
+   │  - /listings        │
+   │  - /sync/stats      │
+   │  - /sync/duplicates │
+   └─────────────────────┘
 ```
 
 ---
 
-## Key Design Decisions
+## API Endpoints
 
-### 1. Schema Normalization
-Each source uses different field names for the same concept:
+### 1. Get Listings
 
-| Concept   | Bayut          | Property Finder | Dubizzle   |
-|-----------|----------------|-----------------|------------|
-| Price     | `asking_price` | `sale_price`    | `price_aed`|
-| Area      | `size_sqft`    | `area`          | `sqft`     |
-| Bedrooms  | `beds`         | `num_bedrooms`  | `rooms`    |
-| Format    | JSON           | XML             | CSV        |
+```bash
+curl "http://localhost:3000/api/listings?city=Dubai&type=sale&limit=10"
+```
 
-A dedicated normalizer per source maps all of these to one standard schema. Adding a new source = writing one normalizer function.
+**Query Parameters:**
+- `city` — Filter by city (case-insensitive partial match)
+- `area` — Filter by neighborhood
+- `type` — `sale` or `rent`
+- `property_type` — `apartment`, `villa`, `office`, `penthouse`
+- `min_price`, `max_price` — Price range in AED
+- `bedrooms` — Exact bedroom count
+- `source` — `bayut`, `property_finder`, `dubizzle`
+- `page` — Page number (default 1)
+- `limit` — Results per page (default 20, max 100)
+- `sort_by` — `price`, `area_sqft`, `synced_at`
+- `sort_order` — `asc` or `desc`
+- `include_duplicates` — `true` to include flagged duplicates (default false)
 
-### 2. Fuzzy Deduplication (Weighted Scoring)
-Exact matching fails because the same property listed on two platforms will have slightly different prices (agent's discretion), slightly different sqft measurements, and different descriptions.
-
-Instead, we score two listings across 5 dimensions:
-
-| Field           | Weight |
-|-----------------|--------|
-| Location area   | 30 pts |
-| Price (±5%)     | 25 pts |
-| Area sqft (±5%) | 20 pts |
-| Bedrooms        | 15 pts |
-| Property type   | 10 pts |
-
-If score ≥ 70 → flagged as duplicate. The original (first ingested) is kept; the duplicate is stored with a reference to the original and the match score.
-
-Same-source comparisons are skipped — a Bayut listing is never compared to another Bayut listing.
-
-### 3. Idempotent Ingestion
-Running the sync twice produces the same result. Each listing uses `UPSERT` on `(external_id, source)`. No duplicate rows, no data corruption on re-runs.
-
-### 4. Audit Trail
-Every sync run is logged in `sync_logs` with counts for fetched, inserted, updated, and duplicates. Every duplicate relationship is stored in `duplicate_pairs` with the matched fields and confidence score — useful for debugging false positives.
+**Response:**
+```json
+{
+  "data": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "external_id": "BAY-1001",
+      "source": "bayut",
+      "title": "Spacious 2BR Apartment Downtown Dubai",
+      "property_type": "apartment",
+      "listing_type": "sale",
+      "price": 1800000,
+      "currency": "AED",
+      "area_sqft": 1200,
+      "bedrooms": 2,
+      "bathrooms": 2,
+      "location_city": "Dubai",
+      "location_area": "Downtown Dubai",
+      "location_lat": 25.1972,
+      "location_lng": 55.2744,
+      "description": "Beautiful apartment with Burj Khalifa view",
+      "amenities": ["gym", "pool", "parking", "security"],
+      "images": ["https://example.com/img1.jpg"],
+      "contact_name": "Ahmed Al Mansoori",
+      "contact_phone": "+971501234567",
+      "contact_email": "ahmed@bayut.com",
+      "is_duplicate": false,
+      "duplicate_of": null,
+      "synced_at": "2026-06-28T07:30:00.000Z",
+      "created_at": "2026-06-27T07:19:05.000Z"
+    }
+  ],
+  "pagination": {
+    "total": 45,
+    "page": 1,
+    "limit": 10,
+    "total_pages": 5
+  }
+}
+```
 
 ---
 
-## API Reference
+### 2. Get Single Listing
 
-### Listings
-
-```
-GET /api/listings
+```bash
+curl "http://localhost:3000/api/listings/{id}"
 ```
 
-**Query parameters:**
+Returns the listing object directly.
 
-| Param               | Type    | Description                              |
-|---------------------|---------|------------------------------------------|
-| city                | string  | Filter by city (partial match)           |
-| area                | string  | Filter by neighborhood (partial match)   |
-| type                | string  | `sale` or `rent`                         |
-| property_type       | string  | `apartment`, `villa`, `office`, etc.     |
-| min_price           | number  | Minimum price in AED                     |
-| max_price           | number  | Maximum price in AED                     |
-| bedrooms            | number  | Exact bedroom count                      |
-| source              | string  | `bayut`, `property_finder`, `dubizzle`   |
-| include_duplicates  | boolean | Include duplicate listings (default: false)|
-| page                | number  | Page number (default: 1)                 |
-| limit               | number  | Results per page (default: 20, max: 100) |
-| sort_by             | string  | `price`, `area_sqft`, `synced_at`        |
-| sort_order          | string  | `asc` or `desc`                          |
+---
 
+### 3. Dashboard Stats
+
+```bash
+curl "http://localhost:3000/api/sync/stats"
 ```
-GET /api/listings/:id       — Single listing by ID
-GET /api/sync/stats         — Dashboard summary stats
-GET /api/sync/logs          — Sync run history
-GET /api/sync/duplicates    — All detected duplicates with originals
+
+**Response:**
+```json
+{
+  "listings": {
+    "total_listings": "12",
+    "unique_listings": "7",
+    "duplicate_listings": "5",
+    "for_sale": "8",
+    "for_rent": "4"
+  },
+  "duplicates": {
+    "total_pairs": "5"
+  },
+  "sync": {
+    "total_runs": "3",
+    "total_fetched": "12",
+    "total_inserted": "12",
+    "last_sync": "2026-06-28T07:30:00.000Z"
+  },
+  "by_source": [
+    { "source": "bayut", "count": "4" },
+    { "source": "property_finder", "count": "3" },
+    { "source": "dubizzle", "count": "2" }
+  ]
+}
+```
+
+---
+
+### 4. View Detected Duplicates
+
+```bash
+curl "http://localhost:3000/api/sync/duplicates?limit=10"
+```
+
+**Response:**
+```json
+{
+  "data": [
+    {
+      "id": "uuid",
+      "external_id": "DUB-9002",
+      "source": "dubizzle",
+      "title": "3 Bed Villa Arabian Ranches",
+      "price": "3480000.00",
+      "area_sqft": "2820.00",
+      "bedrooms": 3,
+      "location_area": "Arabian Ranches",
+      "location_city": "Dubai",
+      "duplicate_score": "100.00",
+      "duplicate_of": "original-listing-id",
+      "original_external_id": "BAY-1002",
+      "original_source": "bayut",
+      "original_title": "3BR Villa in Arabian Ranches"
+    }
+  ],
+  "pagination": { "total": 5, "page": 1, "limit": 10 }
+}
+```
+
+---
+
+### 5. Sync History
+
+```bash
+curl "http://localhost:3000/api/sync/logs?limit=5&source=bayut"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": "uuid",
+    "source": "bayut",
+    "status": "success",
+    "total_fetched": 4,
+    "total_inserted": 4,
+    "total_updated": 0,
+    "total_duplicates": 1,
+    "error_message": null,
+    "started_at": "2026-06-28T07:30:00.000Z",
+    "completed_at": "2026-06-28T07:30:05.000Z"
+  }
+]
+```
+
+---
+
+## How Deduplication Works
+
+**Example: Two listings arrive**
+
+Listing A (Bayut):
+- Title: "Spacious 2BR Downtown Dubai"
+- Price: 1,800,000 AED
+- Area: 1,200 sqft
+- Bedrooms: 2
+- Location: Downtown Dubai
+
+Listing B (Dubizzle):
+- Title: "2BR Flat Downtown Dubai"
+- Price: 1,790,000 AED
+- Area: 1,205 sqft
+- Bedrooms: 2
+- Location: Downtown Dubai
+
+**Scoring Process:**
+```
+✓ Location area match (Downtown Dubai == Downtown Dubai):  +30 pts
+✓ Price within 5% (1.8M vs 1.79M = 0.55% difference):    +25 pts
+✓ Area within 5% (1200 vs 1205 = 0.4% difference):       +20 pts
+✓ Bedrooms match (2 == 2):                                +15 pts
+✓ Property type match (apartment == apartment):           +10 pts
+────────────────────────────────────────────────────────────
+  TOTAL: 100 pts  >=  70 pt threshold  →  DUPLICATE DETECTED
+```
+
+**Result:**
+- Listing A (Bayut) kept as the original
+- Listing B marked as duplicate with 100% confidence score
+- Both queryable via API — frontend shows which is original
+
+This approach catches same properties listed with price variations (±5%) while avoiding false positives on nearby units.
+
+---
+
+## Database Schema
+
+```sql
+-- Single source of truth for all listings
+listings (
+  id UUID PRIMARY KEY,
+  external_id VARCHAR(255),           -- source's ID
+  source VARCHAR(100),                -- bayut, property_finder, dubizzle
+  title VARCHAR(500),
+  property_type VARCHAR(100),
+  listing_type VARCHAR(50),           -- sale or rent
+  price NUMERIC(15, 2),
+  currency VARCHAR(10),
+  area_sqft NUMERIC(10, 2),
+  bedrooms INTEGER,
+  bathrooms INTEGER,
+  location_city VARCHAR(255),
+  location_area VARCHAR(255),
+  location_lat NUMERIC(10, 7),
+  location_lng NUMERIC(10, 7),
+  description TEXT,
+  amenities TEXT[],                   -- array of strings
+  images TEXT[],                      -- array of URLs
+  contact_name VARCHAR(255),
+  contact_phone VARCHAR(100),
+  contact_email VARCHAR(255),
+  raw_data JSONB,                     -- original payload for debugging
+  is_duplicate BOOLEAN DEFAULT FALSE,
+  duplicate_of UUID REFERENCES listings(id),
+  duplicate_score NUMERIC(5, 2),      -- 0-100 confidence
+  synced_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(external_id, source),
+  INDEX on (is_duplicate, source, location_city)
+);
+
+-- Audit trail of all sync runs
+sync_logs (
+  id UUID PRIMARY KEY,
+  source VARCHAR(100),
+  status VARCHAR(50),                 -- success, partial, failed
+  total_fetched INTEGER,
+  total_inserted INTEGER,
+  total_updated INTEGER,
+  total_duplicates INTEGER,
+  error_message TEXT,
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
+);
+
+-- Duplicate relationship tracking
+duplicate_pairs (
+  id UUID PRIMARY KEY,
+  listing_a UUID REFERENCES listings(id),
+  listing_b UUID REFERENCES listings(id),
+  score NUMERIC(5, 2),                -- 0-100
+  matched_fields TEXT[],              -- which fields matched
+  created_at TIMESTAMPTZ
+);
 ```
 
 ---
 
 ## Local Setup
 
+### Prerequisites
+- Node.js 18+ (check: `node --version`)
+- PostgreSQL 14+ (check: `psql --version`)
+
+### Step 1: Clone
+
 ```bash
-# 1. Clone and install
-git clone <repo>
+git clone https://github.com/palwashasheikh/property-sync-service
 cd property-sync-service
 npm install
+```
 
-# 2. Configure environment
-cp .env.example .env
-# Edit .env with your PostgreSQL credentials
+### Step 2: Create Database
 
-# 3. Create database
+```bash
+# Create the database
 createdb property_sync
 
-# 4. Run migrations
-npm run migrate
+# (Optional) Create dedicated user
+createuser property_dev
+psql -U postgres -d property_sync -c "ALTER USER property_dev WITH PASSWORD 'your_password';"
+psql -U postgres -d property_sync -c "GRANT ALL PRIVILEGES ON DATABASE property_sync TO property_dev;"
+```
 
-# 5. Start the service
+### Step 3: Environment Variables
+
+```bash
+cp .env.example .env
+
+# Edit .env
+# DB_HOST=localhost
+# DB_PORT=5432
+# DB_NAME=property_sync
+# DB_USER=postgres (or property_dev)
+# DB_PASSWORD=your_password
+# PORT=3000
+```
+
+### Step 4: Run Migration
+
+```bash
+npm run migrate
+```
+
+Expected output:
+```
+✅ Migration complete
+```
+
+### Step 5: Start
+
+```bash
 npm run dev
 ```
 
-The service will start, run an immediate sync, then sync every 30 minutes.
+You should see:
+```
+🚀 Property Sync Service running on http://localhost:3000
+📡 Sync started at [time]
+🕐 Scheduler started — syncing every 30 minutes
+```
+
+### Step 6: Test
+
+```bash
+curl http://localhost:3000/api/sync/stats
+```
+
+---
+
+## Troubleshooting
+
+**"Connection refused" on database**
+- Verify PostgreSQL is running: `psql -U postgres`
+- Check .env credentials
+- Verify database exists: `psql -U postgres -l | grep property_sync`
+
+**"Permission denied for schema public"**
+```bash
+psql -U postgres -d property_sync -c "GRANT USAGE ON SCHEMA public TO property_dev;"
+psql -U postgres -d property_sync -c "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO property_dev;"
+```
+
+**"relation 'listings' does not exist"**
+- Migration didn't run
+- Solution: `npm run migrate`
+
+**"Port 3000 already in use"**
+```bash
+# Linux/Mac
+lsof -i :3000 | grep -v PID | awk '{print $2}' | xargs kill -9
+
+# Windows
+netstat -ano | findstr :3000
+taskkill /PID [PID] /F
+```
+
+---
+
+
+**Current bottlenecks:**
+
+1. **Cron-based sync** single point of failure
+   → Replace with BullMQ job queue
+
+2. **Full re-fetch every 30 min** — wasteful
+   → Add Change Data Capture (CDC) to detect only new/updated listings
+
+3. **In-memory deduplication** — doesn't scale past 100k listings
+   → Use Redis sorted sets with geo-hashing + price bucketing
+
+4. **Deterministic scoring** false positives
+   → Train ML model on price_diff + area_diff + location_distance + description_similarity
+
+5. **Single write DB**  sync blocks API queries
+   → Read replicas for API, separate write DB for ingestion
 
 ---
 
 ## Stack
 
-- **Node.js + Express** — API and ingestion pipeline
-- **PostgreSQL** — Primary data store
-- **node-cron** — Sync scheduling
-- **fast-xml-parser** — XML source parsing (Property Finder)
-- **csv-parse** — CSV source parsing (Dubizzle)
+- **Runtime:** Node.js 18+
+- **Framework:** Express 4.18
+- **Database:** PostgreSQL 14+
+- **Job Scheduling:** node-cron
+- **Parsing:** fast-xml-parser (XML), csv-parse (CSV)
+- **HTTP Client:** Axios
+- **UUID:** uuid
 
 ---
 
-## What I'd Do Differently at Scale
+## GitHub
 
-**Current approach works for small-to-medium volume. At scale:**
-
-1. **Replace cron with a message queue (BullMQ / RabbitMQ)**
-   — Each source becomes an independent worker. Failed jobs retry automatically. No risk of one slow source blocking others.
-
-2. **Add CDC (Change Data Capture) instead of polling**
-   — Instead of fetching all listings every 30 min, detect and sync only changed listings. Reduces load significantly.
-
-3. **Cache deduplication candidates in Redis**
-   — Currently we load all non-duplicate listings into memory on every sync run. At 100k+ listings, this needs to be a Redis sorted set lookup by geo-hash + price bucket.
-
-4. **Smarter deduplication with ML**
-   — The current scoring is deterministic. A simple trained classifier on (price_diff, area_diff, location_distance, description_similarity) would reduce false positives significantly.
-
-5. **Separate read/write databases**
-   — Write DB for ingestion pipeline, read replica for API. Prevents sync jobs from affecting API response times.
+https://github.com/palwashasheikh/property-sync-service
